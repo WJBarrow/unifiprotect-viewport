@@ -1,0 +1,12 @@
+# Secrets and runtime auth — never commit
+.env
+*.env
+!.env.example
+
+# Runtime logs (mounted volume)
+logs/
+*.log
+
+# Python
+__pycache__/
+*.pyc

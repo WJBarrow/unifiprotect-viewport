@@ -1,0 +1,10 @@
+services:
+  service:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "${WEBHOOK_PORT:-8686}:${WEBHOOK_PORT:-8686}"
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
