@@ -3,9 +3,13 @@
 *.env
 !.env.example
 
-# Runtime logs (mounted volume)
+# Runtime logs + persisted switch state (mounted volume)
 logs/
 *.log
+switch_state.json
+
+# Security reports — local-only, never commit (may detail live vulns/secrets)
+SECURITY_REPORT.md
 
 # Python
 __pycache__/

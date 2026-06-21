@@ -11,6 +11,7 @@ login flow as unifi-protect-privacy, just a different API path prefix.
 from __future__ import annotations
 
 import base64
+import html as html_lib
 import json
 import logging
 import logging.handlers
@@ -24,6 +25,8 @@ from urllib.parse import urlparse, parse_qs
 
 import requests
 import urllib3
+
+MAX_BODY = 64 * 1024  # L2: cap webhook/test request bodies to avoid memory exhaustion
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -39,9 +42,14 @@ class Config:
         self.viewer_id = os.environ.get("VIEWER_ID", "")  # optional override
         self.verify_ssl = os.environ.get("VERIFY_SSL", "false").lower() == "true"
         self.webhook_port = int(os.environ.get("WEBHOOK_PORT", "8686"))
-        self.alarm_timeout = int(os.environ.get("ALARM_TIMEOUT", "30"))
+        self.alarm_timeout = int(os.environ.get("ALARM_TIMEOUT", "7"))
         self.log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
         self.log_file = os.environ.get("LOG_FILE", "")
+        # HomeKit enable/disable switch (driven by the Homebridge HTTP-SWITCH
+        # accessory). Optional bearer token guards the /switch endpoints; the
+        # enabled flag is persisted here so it survives container restarts.
+        self.switch_token = os.environ.get("SWITCH_TOKEN", "")
+        self.state_file = os.environ.get("STATE_FILE", "/app/logs/switch_state.json")
 
     def validate(self) -> None:
         missing = [k for k, v in [
@@ -211,19 +219,66 @@ class Controller:
         self._timer: threading.Timer | None = None
         self._saved: dict = {}
         self.last_triggered = self.last_view = self.last_restored = None
+        self._enabled = self._load_enabled()
 
     def connect(self) -> None:
         self.client.connect()
 
+    # --- HomeKit enable/disable switch -----------------------------------
+    def _load_enabled(self) -> bool:
+        try:
+            with open(self.config.state_file) as f:
+                return bool(json.load(f).get("enabled", True))
+        except Exception:
+            return True  # default ON — switching is enabled out of the box
+
+    def _save_enabled(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(self.config.state_file), exist_ok=True)
+            with open(self.config.state_file, "w") as f:
+                json.dump({"enabled": self._enabled}, f)
+        except Exception as exc:
+            log.warning("could not persist switch state to %s: %s",
+                        self.config.state_file, exc)
+
+    def is_enabled(self) -> bool:
+        with self._lock:
+            return self._enabled
+
+    def set_enabled(self, enabled: bool) -> None:
+        with self._lock:
+            if self._enabled == enabled:
+                return
+            self._enabled = enabled
+            self._save_enabled()
+        log.info("viewport auto-switching %s via HomeKit switch",
+                 "ENABLED" if enabled else "DISABLED")
+        # If we're disabling while a camera view is held, revert now so the
+        # viewport isn't left stuck on the alarmed view.
+        if not enabled:
+            self._restore_now()
+
+    def _restore_now(self) -> None:
+        with self._lock:
+            if self._state != self.ALARMED:
+                return
+            if self._timer:
+                self._timer.cancel()
+        self._restore()
+
     def get_state_dict(self) -> dict:
         with self._lock:
-            return {"alarm_state": self._state,
+            return {"enabled": self._enabled,
+                    "alarm_state": self._state,
                     "last_triggered": self.last_triggered,
                     "last_view": self.last_view,
                     "last_restored": self.last_restored,
                     "views": sorted(self.client.views)}
 
     def trigger(self, view_name: str) -> None:
+        if not self.is_enabled():
+            log.info("auto-switching disabled — ignoring trigger for '%s'", view_name)
+            return
         if not self.client.has_view(view_name):
             log.warning("ignoring trigger for unknown Live View '%s'", view_name)
             return
@@ -294,15 +349,46 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _text(self, code: int, body: str):
+        data = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def _view_from_query(self) -> str:
         return parse_qs(urlparse(self.path).query).get("view", [""])[0]
 
+    def _switch_authorized(self) -> bool:
+        token = self.config.switch_token
+        if not token:
+            return True  # auth disabled
+        return self.headers.get("Authorization", "") == f"Bearer {token}"
+
+    def _handle_switch(self, path: str):
+        """Toggle viewport auto-switching. Drives the HomeKit switch tile."""
+        if not self._switch_authorized():
+            self._json(401, {"error": "unauthorized"})
+            return
+        enabled = path.endswith("/on")
+        self.controller.set_enabled(enabled)
+        self._json(200, {"enabled": enabled})
+
     def do_GET(self):
         path = urlparse(self.path).path
-        if path in ("/", "/status"):
+        if path == "/switch/state":
+            # Plain "1"/"0" body for homebridge-http-switch statusPattern.
+            if not self._switch_authorized():
+                self._json(401, {"error": "unauthorized"})
+                return
+            self._text(200, "1" if self.controller.is_enabled() else "0")
+        elif path in ("/switch/on", "/switch/off"):
+            self._handle_switch(path)  # GET allowed for manual testing
+        elif path in ("/", "/status"):
             sd = self.controller.get_state_dict()
             html = (f"<h1>Viewport switcher — port {self.config.webhook_port}</h1>"
-                    f"<pre>{json.dumps(sd, indent=2)}</pre>")
+                    f"<pre>{html_lib.escape(json.dumps(sd, indent=2))}</pre>")
             data = html.encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -320,12 +406,15 @@ class Handler(BaseHTTPRequestHandler):
             self._webhook()
         elif path == "/test":
             self._test()
+        elif path in ("/switch/on", "/switch/off"):
+            self._handle_switch(path)
         else:
             self._json(404, {"error": "not found"})
 
     def _webhook(self):
         view = self._view_from_query()
-        raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        length = min(int(self.headers.get("Content-Length", 0)), MAX_BODY)
+        raw = self.rfile.read(length)
         log.debug("webhook raw (%d bytes): %s", len(raw), raw[:2000])
         try:
             data = json.loads(raw) if raw else {}
@@ -357,12 +446,19 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"triggered": False, "reason": "missing ?view="})
             return
         keys = [t.get("key") or t.get("Key", "") for t in triggers if isinstance(t, dict)]
+        # Reflect the HomeKit switch in the response (still 200 so Protect's Alarm
+        # Manager treats it as delivered — no webhook reconfiguration needed).
+        if not self.controller.is_enabled():
+            log.info("webhook keys=%s view=%s — auto-switching disabled, ignored", keys, view)
+            self._json(200, {"triggered": False, "reason": "auto-switching disabled",
+                             "view": view, "trigger_keys": keys})
+            return
         log.info("webhook keys=%s view=%s", keys, view)
         threading.Thread(target=self.controller.trigger, args=(view,), daemon=True).start()
         self._json(200, {"triggered": True, "view": view, "trigger_keys": keys})
 
     def _test(self):
-        length = int(self.headers.get("Content-Length", 0))
+        length = min(int(self.headers.get("Content-Length", 0)), MAX_BODY)
         try:
             data = json.loads(self.rfile.read(length)) if length else {}
         except Exception:

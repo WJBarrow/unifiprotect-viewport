@@ -23,6 +23,31 @@ borrowed from `unifi-protect-privacy`.
   saved "previous view" stays the one captured on the first trigger, so it always
   reverts to where you actually left it.
 
+## HomeKit on/off switch
+
+A **"Viewport Auto-Switch"** tile in the Home app turns motion-driven switching on
+and off, so you can stop the viewports flipping around (e.g. while watching TV)
+without touching the container. It's driven by the already-paired Homebridge
+bridge on this host (`homebridge-http-switch`, stateful) calling these endpoints:
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /switch/on` | enable auto-switching |
+| `POST /switch/off` | disable (and immediately revert any held view) |
+| `GET /switch/state` | `1` if enabled, `0` if disabled (for the switch's status poll) |
+
+The flag is persisted to `STATE_FILE` (on the mounted `./logs` volume) so it
+survives restarts. When `SWITCH_TOKEN` is set, all three endpoints require an
+`Authorization: Bearer <token>` header — the Homebridge accessory sends the
+matching header. While disabled, motion webhooks are accepted but ignored (200,
+logged). The accessory lives in the live Homebridge `config.json`; adding it
+needs no re-pair (it appears as a new tile inside the existing bridge).
+
+```bash
+curl -X POST http://localhost:8686/switch/off -H 'Authorization: Bearer <token>'
+curl     http://localhost:8686/switch/state -H 'Authorization: Bearer <token>'  # -> 0
+```
+
 ## Setup
 
 1. **In Protect:** create one single-camera **Live View** per camera you want
@@ -65,7 +90,9 @@ curl -X POST http://localhost:8686/webhook -d '{}'
 | `VIEWER_ID` | no | pin viewer id(s) explicitly, comma-separated |
 | `VERIFY_SSL` | no | default `false` (self-signed cert) |
 | `WEBHOOK_PORT` | no | default `8686` |
-| `ALARM_TIMEOUT` | no | seconds before reverting, default `30` |
+| `ALARM_TIMEOUT` | no | seconds before reverting, default `7` |
+| `SWITCH_TOKEN` | no | bearer token guarding `/switch/*` (must match the Homebridge accessory); empty = no auth |
+| `STATE_FILE` | no | where the enable/disable flag is persisted, default `/app/logs/switch_state.json` |
 | `LOG_LEVEL` / `LOG_FILE` | no | standard logging block |
 
 After editing `service.py`, rebuild: `docker compose up -d --build` (the source is
